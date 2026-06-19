@@ -75,6 +75,7 @@ class Payment_Adapter_EasyPay implements \FOSSBilling\InjectionAwareInterface
                 . 'mobile money and bank transfers are recorded as pending for an administrator to verify.',
             'form' => [
                 // --- Leapa (automatic card payments) -------------------------
+                'enable_leapa' => self::toggle('Enable Leapa (VISA / Mastercard)'),
                 'leapa_test_key' => self::textField(
                     'Leapa API key — test',
                     'Used while the gateway is in test mode. Leave empty if unused.'
@@ -109,9 +110,6 @@ class Payment_Adapter_EasyPay implements \FOSSBilling\InjectionAwareInterface
                 'bank_account_holder' => self::textField('Account holder name'),
                 'bank_account_number' => self::textField('Account number (11 digits)'),
                 'bank_swift' => self::textField('SWIFT / BIC code'),
-
-                // --- Leapa toggle last so the card panel can be turned off ----
-                'enable_leapa' => self::toggle('Enable Leapa (VISA / Mastercard)'),
             ],
         ];
     }
@@ -137,7 +135,6 @@ class Payment_Adapter_EasyPay implements \FOSSBilling\InjectionAwareInterface
 
         $ctx = [
             'notify' => $this->notifyUrl($invoice),
-            'redirect' => $this->redirectUrl($invoice),
             'invoice' => (string) $invoice->id,
             'gateway' => $this->gatewayId(),
             'amount_attr' => $this->amountForGateway($total),
@@ -165,8 +162,8 @@ class Payment_Adapter_EasyPay implements \FOSSBilling\InjectionAwareInterface
         }
 
         $jsConfig = json_encode([
-            'redirect' => $ctx['redirect'],
             'phoneError' => 'Enter a valid Burundian phone number (8 digits, e.g. +257 79 00 00 00).',
+            'leapaJs' => 'https://widgets.leapa.co/customer.js',
         ], JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP);
 
         return strtr($this->shell(), [
@@ -435,6 +432,9 @@ class Payment_Adapter_EasyPay implements \FOSSBilling\InjectionAwareInterface
         $hidden = $this->hiddenFields('leapa', $ctx)
             . '<input type="hidden" name="leapa_charge_id" id="ep-leapa-charge" value="">';
 
+        // The Leapa widget script is an ES module; it is loaded from our JS
+        // (with graceful failure) rather than a static tag, so a load error
+        // can never surface as an unhandled cross-origin "Script error".
         return ''
             . '<p class="ep-lead">Pay securely by VISA or Mastercard. Your card is charged instantly '
             . 'and your order is activated automatically.</p>'
@@ -442,10 +442,9 @@ class Payment_Adapter_EasyPay implements \FOSSBilling\InjectionAwareInterface
             . '<leapa-customer id="ep-leapa" key="' . $key . '" mode="charge" amount="' . $amount . '" '
             . 'currency="' . $currency . '" description="' . $desc . '" tos="true"></leapa-customer>'
             . '</div>'
-            . '<form id="ep-leapa-form" class="ep-hidden" method="post" action="' . $this->esc($ctx['notify']) . '" target="easypay_sink">'
+            . '<form id="ep-leapa-form" class="ep-hidden" method="post" action="' . $this->esc($ctx['notify']) . '">'
             . $hidden
-            . '</form>'
-            . '<script src="https://widgets.leapa.co/customer.js" async></script>';
+            . '</form>';
     }
 
     private function renderMobilePanel(string $method, array $ctx): string
@@ -516,7 +515,7 @@ class Payment_Adapter_EasyPay implements \FOSSBilling\InjectionAwareInterface
     {
         return ''
             . '<form class="ep-form" method="post" action="' . $this->esc($ctx['notify']) . '" '
-            . 'target="easypay_sink" data-method="' . $this->esc($method) . '">'
+            . 'data-method="' . $this->esc($method) . '">'
             . $this->hiddenFields($method, $ctx)
             . '<div class="ep-field">'
             . '<label>Your phone number</label>'
@@ -535,10 +534,13 @@ class Payment_Adapter_EasyPay implements \FOSSBilling\InjectionAwareInterface
 
     private function hiddenFields(string $method, array $ctx): string
     {
+        // The notify URL already carries invoice_id / gateway_id in its query
+        // string; these mirror them in the POST body as a safety net. The names
+        // match what FOSSBilling's ipn.php reads (invoice_id / gateway_id).
         return ''
             . '<input type="hidden" name="easypay_method" value="' . $this->esc($method) . '">'
-            . '<input type="hidden" name="bb_invoice_id" value="' . $this->esc($ctx['invoice']) . '">'
-            . '<input type="hidden" name="bb_gateway_id" value="' . $this->esc($ctx['gateway']) . '">';
+            . '<input type="hidden" name="invoice_id" value="' . $this->esc($ctx['invoice']) . '">'
+            . '<input type="hidden" name="gateway_id" value="' . $this->esc($ctx['gateway']) . '">';
     }
 
     /** The outer markup, styles and behaviour. Dynamic parts are injected via strtr(). */
@@ -594,37 +596,13 @@ class Payment_Adapter_EasyPay implements \FOSSBilling\InjectionAwareInterface
     <div class="ep-tabs">{{tabs}}</div>
     <div class="ep-body">{{panels}}</div>
 
-    <iframe name="easypay_sink" class="ep-hidden" title="EasyPay"></iframe>
-
     <script>
     (function () {
         var CFG = {{config}};
-        var root = document.currentScript ? document.currentScript.closest('.easypay') : document.querySelector('.easypay');
-        if (!root) { return; }
+        var PHONE_ERROR = CFG.phoneError || 'Enter a valid Burundian phone number.';
+        var LEAPA_JS = CFG.leapaJs || 'https://widgets.leapa.co/customer.js';
 
-        // --- Tabs ---------------------------------------------------------
-        var tabs = root.querySelectorAll('.ep-tab');
-        var panels = root.querySelectorAll('.ep-panel');
-        tabs.forEach(function (tab) {
-            tab.addEventListener('click', function () {
-                var method = tab.getAttribute('data-method');
-                tabs.forEach(function (t) { t.classList.toggle('is-active', t === tab); });
-                panels.forEach(function (p) { p.hidden = p.getAttribute('data-method') !== method; });
-            });
-        });
-
-        // --- Copy to clipboard -------------------------------------------
-        root.querySelectorAll('.ep-copy').forEach(function (el) {
-            el.addEventListener('click', function () {
-                var value = el.getAttribute('data-copy') || el.textContent;
-                if (navigator.clipboard) { navigator.clipboard.writeText(value).catch(function () {}); }
-                var original = el.textContent;
-                el.textContent = 'Copied';
-                setTimeout(function () { el.textContent = original; }, 1200);
-            });
-        });
-
-        // --- Burundian phone validation (mirrors the PHP side) ------------
+        // Burundian phone validation (mirrors the PHP side).
         function normalizePhone(value) {
             var d = (value || '').replace(/\D+/g, '');
             var prefixes = ['00257', '0257', '257'];
@@ -635,49 +613,90 @@ class Payment_Adapter_EasyPay implements \FOSSBilling\InjectionAwareInterface
             return /^\d{8}$/.test(d) ? d : null;
         }
 
-        function redirect() {
-            if (CFG.redirect) { window.location.href = CFG.redirect; }
-            else { window.location.reload(); }
-        }
+        // Event delegation on document so behaviour survives however FOSSBilling
+        // injects this markup, and binds only once even if the script runs twice.
+        if (!window.__easypayDelegated) {
+            window.__easypayDelegated = true;
 
-        // --- Manual confirmation forms -----------------------------------
-        root.querySelectorAll('.ep-form').forEach(function (form) {
-            form.addEventListener('submit', function (ev) {
-                ev.preventDefault();
+            document.addEventListener('click', function (e) {
+                if (!e.target.closest) { return; }
+                var tab = e.target.closest('.ep-tab');
+                if (tab) {
+                    var root = tab.closest('.easypay');
+                    if (!root) { return; }
+                    var method = tab.getAttribute('data-method');
+                    root.querySelectorAll('.ep-tab').forEach(function (t) { t.classList.toggle('is-active', t === tab); });
+                    root.querySelectorAll('.ep-panel').forEach(function (p) { p.hidden = p.getAttribute('data-method') !== method; });
+                    return;
+                }
+                var copy = e.target.closest('.ep-copy');
+                if (copy) {
+                    var value = copy.getAttribute('data-copy') || copy.textContent;
+                    if (navigator.clipboard) { navigator.clipboard.writeText(value).catch(function () {}); }
+                    var original = copy.textContent;
+                    copy.textContent = 'Copied';
+                    setTimeout(function () { copy.textContent = original; }, 1200);
+                }
+            });
+
+            // Manual forms: validate the phone, then let the form submit normally.
+            // ipn.php records the pending transaction and redirects back to the
+            // invoice (redirect=true&invoice_hash in the action URL).
+            document.addEventListener('submit', function (e) {
+                var form = e.target.closest ? e.target.closest('.ep-form') : null;
+                if (!form) { return; }
                 var phone = form.querySelector('.ep-phone');
                 var error = form.querySelector('.ep-error');
                 if (phone && !normalizePhone(phone.value)) {
-                    if (error) { error.textContent = CFG.phoneError; error.hidden = false; }
+                    e.preventDefault();
+                    if (error) { error.textContent = PHONE_ERROR; error.hidden = false; }
                     phone.focus();
                     return;
                 }
                 if (error) { error.hidden = true; }
                 var button = form.querySelector('.ep-btn');
-                if (button) { button.disabled = true; button.textContent = 'Recording your payment…'; }
-                form.submit();
-                form.innerHTML = '<div class="ep-flash">Thank you! Your payment has been recorded and is '
-                    + 'awaiting verification. You can close this page.</div>';
-                setTimeout(redirect, 2000);
+                if (button) { button.disabled = true; button.textContent = 'Confirming…'; }
             });
-        });
+        }
 
-        // --- Leapa automatic card flow -----------------------------------
-        var leapa = root.querySelector('#ep-leapa');
-        var leapaForm = root.querySelector('#ep-leapa-form');
-        if (leapa && leapaForm) {
+        // Leapa card flow: bind onSuccess and load the widget (an ES module)
+        // defensively so a load failure degrades gracefully instead of throwing.
+        function initLeapa() {
+            var leapa = document.getElementById('ep-leapa');
+            var leapaForm = document.getElementById('ep-leapa-form');
+            if (!leapa || !leapaForm || leapa.getAttribute('data-ep-bound')) { return; }
+            leapa.setAttribute('data-ep-bound', '1');
+
             leapa.addEventListener('onSuccess', function (e) {
                 var detail = (e && e.detail) || {};
                 var invoice = detail.invoice || detail;
                 var chargeId = invoice.charge || invoice.id || detail.charge || detail.id || '';
-                var field = root.querySelector('#ep-leapa-charge');
+                var field = document.getElementById('ep-leapa-charge');
                 if (field) { field.value = chargeId; }
                 leapaForm.submit();
-                var widgetBox = leapa.closest('.ep-panel');
-                if (widgetBox) {
-                    widgetBox.innerHTML = '<div class="ep-flash">Payment successful! Activating your order…</div>';
-                }
-                setTimeout(redirect, 2200);
             });
+
+            if (!document.querySelector('script[data-easypay-leapa]')) {
+                var s = document.createElement('script');
+                s.type = 'module';
+                s.src = LEAPA_JS;
+                s.async = true;
+                s.setAttribute('data-easypay-leapa', '1');
+                s.onerror = function () {
+                    var panel = leapa.closest('.ep-panel');
+                    if (panel) {
+                        panel.innerHTML = '<p class="ep-muted">Card payments are temporarily unavailable. '
+                            + 'Please choose another method.</p>';
+                    }
+                };
+                document.head.appendChild(s);
+            }
+        }
+
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', initLeapa);
+        } else {
+            initLeapa();
         }
     })();
     </script>
@@ -778,26 +797,37 @@ HTML;
     // URLs, ids and small utilities
     // -----------------------------------------------------------------------
 
-    /** IPN endpoint for this gateway + invoice, with sensible fallbacks. */
+    /**
+     * IPN endpoint for this gateway + invoice.
+     *
+     * Uses FOSSBilling's own PayGateway::getCallbackUrl() (which emits the
+     * correct invoice_id / gateway_id that ipn.php expects), then appends
+     * redirect=true&invoice_hash so the browser is returned to the invoice
+     * after the transaction is processed. Falls back to building the URL by
+     * hand if that service is unavailable.
+     */
     private function notifyUrl(\Model_Invoice $invoice): string
     {
-        if (!empty($this->config['notify_url'])) {
-            return (string) $this->config['notify_url'];
-        }
+        $hash = rawurlencode((string) $invoice->hash);
 
-        return $this->baseUrl() . 'ipn.php?bb_gateway_id=' . $this->gatewayId() . '&bb_invoice_id=' . $invoice->id;
-    }
-
-    /** Where to send the customer once they're done. */
-    private function redirectUrl(\Model_Invoice $invoice): string
-    {
-        foreach (['redirect_url', 'return_url'] as $key) {
-            if (!empty($this->config[$key])) {
-                return (string) $this->config[$key];
+        try {
+            $gateway = $this->di['db']->findOne('PayGateway', 'gateway = :g', [':g' => 'EasyPay']);
+            if ($gateway) {
+                $payGatewayService = $this->di['mod_service']('Invoice', 'PayGateway');
+                if (is_object($payGatewayService) && method_exists($payGatewayService, 'getCallbackUrl')) {
+                    $url = (string) $payGatewayService->getCallbackUrl($gateway, $invoice);
+                    if ($url !== '') {
+                        return $url . (str_contains($url, '?') ? '&' : '?') . 'redirect=true&invoice_hash=' . $hash;
+                    }
+                }
             }
+        } catch (\Exception $e) {
+            // fall through to the manual build
         }
 
-        return $this->baseUrl() . 'invoice/' . $invoice->hash;
+        return $this->baseUrl() . 'ipn.php?invoice_id=' . (int) $invoice->id
+            . '&gateway_id=' . rawurlencode($this->gatewayId())
+            . '&redirect=true&invoice_hash=' . $hash;
     }
 
     private function baseUrl(): string
