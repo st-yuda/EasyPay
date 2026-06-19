@@ -137,7 +137,8 @@ class Payment_Adapter_EasyPay implements \FOSSBilling\InjectionAwareInterface
             'notify' => $this->notifyUrl($invoice),
             'invoice' => (string) $invoice->id,
             'gateway' => $this->gatewayId(),
-            'amount_attr' => $this->amountForGateway($total),
+            'amount_attr' => $this->amountForGateway($total, $currency),
+            'amount_display' => $this->amountForDisplay($total, $currency),
             'currency' => $currency,
             'desc' => $invoiceRef,
         ];
@@ -461,7 +462,7 @@ class Payment_Adapter_EasyPay implements \FOSSBilling\InjectionAwareInterface
         $steps = ''
             . '<ol class="ep-steps">'
             . '<li>Open your <strong>' . $this->esc($label) . '</strong> app and pay '
-            . '<strong>' . $this->esc($ctx['amount_attr']) . ' ' . $this->esc($ctx['currency']) . '</strong> to:</li>'
+            . '<strong>' . $this->esc($ctx['amount_display']) . ' ' . $this->esc($ctx['currency']) . '</strong> to:</li>'
             . '</ol>'
             . '<div class="ep-merchant">'
             . '<div class="ep-merchant-row"><span>Merchant code</span>'
@@ -503,7 +504,7 @@ class Payment_Adapter_EasyPay implements \FOSSBilling\InjectionAwareInterface
         }
 
         return ''
-            . '<p class="ep-lead">Transfer <strong>' . $this->esc($ctx['amount_attr']) . ' ' . $this->esc($ctx['currency'])
+            . '<p class="ep-lead">Transfer <strong>' . $this->esc($ctx['amount_display']) . ' ' . $this->esc($ctx['currency'])
             . '</strong> to the account below, then confirm so we can match your payment.</p>'
             . '<div class="ep-merchant">' . $rows . '</div>'
             . $accountWarn
@@ -887,18 +888,39 @@ HTML;
         return $default;
     }
 
-    /** Amount string sent to the Leapa widget: integer when whole, else 2 dp. */
-    private function amountForGateway(float $total): string
+    /**
+     * Amount string sent to the Leapa widget.
+     *
+     * Zero-decimal currencies (BIF and friends) have no minor unit, so a
+     * fractional amount cannot be charged — we send a clean integer. Other
+     * currencies are sent with two decimal places.
+     */
+    private function amountForGateway(float $total, string $currency): string
     {
-        return (floor($total) === $total) ? (string) (int) $total : number_format($total, 2, '.', '');
+        if ($this->isZeroDecimalCurrency($currency)) {
+            return (string) (int) round($total);
+        }
+
+        return number_format($total, 2, '.', '');
     }
 
-    /** Human-friendly amount with thousands separators. */
+    /** Human-friendly amount with thousands separators, matching the invoice total. */
     private function amountForDisplay(float $total, string $currency): string
     {
         $decimals = (floor($total) === $total) ? 0 : 2;
 
         return number_format($total, $decimals, '.', ' ');
+    }
+
+    /** ISO 4217 currencies that have no minor unit. */
+    private function isZeroDecimalCurrency(string $currency): bool
+    {
+        static $zeroDecimal = [
+            'BIF', 'CLP', 'DJF', 'GNF', 'ISK', 'JPY', 'KMF', 'KRW',
+            'PYG', 'RWF', 'UGX', 'VND', 'VUV', 'XAF', 'XOF', 'XPF',
+        ];
+
+        return in_array(strtoupper($currency), $zeroDecimal, true);
     }
 
     private function tabLabel(string $method): string
