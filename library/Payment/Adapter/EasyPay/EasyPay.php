@@ -165,6 +165,7 @@ class Payment_Adapter_EasyPay implements \FOSSBilling\InjectionAwareInterface
         $jsConfig = json_encode([
             'phoneError' => 'Enter a valid Burundian phone number (8 digits, e.g. +257 79 00 00 00).',
             'leapaJs' => 'https://widgets.leapa.co/customer.js',
+            'leapaCss' => 'https://widgets.leapa.co/customer.css',
         ], JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP);
 
         return strtr($this->shell(), [
@@ -433,15 +434,18 @@ class Payment_Adapter_EasyPay implements \FOSSBilling\InjectionAwareInterface
         $hidden = $this->hiddenFields('leapa', $ctx)
             . '<input type="hidden" name="leapa_charge_id" id="ep-leapa-charge" value="">';
 
-        // The Leapa widget script is an ES module; it is loaded from our JS
-        // (with graceful failure) rather than a static tag, so a load error
-        // can never surface as an unhandled cross-origin "Script error".
+        // Attribute names follow the official Leapa widget docs: the API key is
+        // "api-key" (NOT "key" — a wrong name makes the widget call .split on
+        // undefined), charge mode needs amount/currency/description, and the
+        // widget script + stylesheet are loaded from our JS (with graceful
+        // failure) so a load error can never surface as a "Script error".
         return ''
             . '<p class="ep-lead">Pay securely by VISA or Mastercard. Your card is charged instantly '
             . 'and your order is activated automatically.</p>'
             . '<div class="ep-card-widget">'
-            . '<leapa-customer id="ep-leapa" key="' . $key . '" mode="charge" amount="' . $amount . '" '
-            . 'currency="' . $currency . '" description="' . $desc . '" tos="true"></leapa-customer>'
+            . '<leapa-customer id="ep-leapa" mode="charge" api-key="' . $key . '" '
+            . 'amount="' . $amount . '" currency="' . $currency . '" description="' . $desc . '" '
+            . 'first-name="true" last-name="true" tos="true" badge="light"></leapa-customer>'
             . '</div>'
             . '<form id="ep-leapa-form" class="ep-hidden" method="post" action="' . $this->esc($ctx['notify']) . '">'
             . $hidden
@@ -602,6 +606,7 @@ class Payment_Adapter_EasyPay implements \FOSSBilling\InjectionAwareInterface
         var CFG = {{config}};
         var PHONE_ERROR = CFG.phoneError || 'Enter a valid Burundian phone number.';
         var LEAPA_JS = CFG.leapaJs || 'https://widgets.leapa.co/customer.js';
+        var LEAPA_CSS = CFG.leapaCss || 'https://widgets.leapa.co/customer.css';
 
         // Burundian phone validation (mirrors the PHP side).
         function normalizePhone(value) {
@@ -676,6 +681,15 @@ class Payment_Adapter_EasyPay implements \FOSSBilling\InjectionAwareInterface
                 if (field) { field.value = chargeId; }
                 leapaForm.submit();
             });
+
+            // The widget requires its stylesheet to render correctly.
+            if (!document.querySelector('link[data-easypay-leapa]')) {
+                var l = document.createElement('link');
+                l.rel = 'stylesheet';
+                l.href = LEAPA_CSS;
+                l.setAttribute('data-easypay-leapa', '1');
+                document.head.appendChild(l);
+            }
 
             if (!document.querySelector('script[data-easypay-leapa]')) {
                 var s = document.createElement('script');
@@ -889,19 +903,15 @@ HTML;
     }
 
     /**
-     * Amount string sent to the Leapa widget.
-     *
-     * Zero-decimal currencies (BIF and friends) have no minor unit, so a
-     * fractional amount cannot be charged — we send a clean integer. Other
-     * currencies are sent with two decimal places.
+     * Amount sent to the Leapa widget: an integer in the currency's smallest
+     * unit (e.g. 1000 = USD 10.00). Zero-decimal currencies such as BIF have no
+     * minor unit, so the integer is the amount itself (e.g. 237401 = BIF 237401).
      */
     private function amountForGateway(float $total, string $currency): string
     {
-        if ($this->isZeroDecimalCurrency($currency)) {
-            return (string) (int) round($total);
-        }
+        $factor = $this->isZeroDecimalCurrency($currency) ? 1 : 100;
 
-        return number_format($total, 2, '.', '');
+        return (string) (int) round($total * $factor);
     }
 
     /** Human-friendly amount with thousands separators, matching the invoice total. */
