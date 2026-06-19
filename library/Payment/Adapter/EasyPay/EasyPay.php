@@ -149,7 +149,7 @@ class Payment_Adapter_EasyPay implements \FOSSBilling\InjectionAwareInterface
         $first = true;
         foreach ($this->availableMethods() as $method) {
             $active = $first ? ' is-active' : '';
-            $hidden = $first ? '' : ' hidden';
+            $hidden = $first ? '' : ' ep-hidden';
             $tabs .= '<button type="button" class="ep-tab' . $active . '" data-method="' . $this->esc($method) . '">'
                 . $this->esc($this->tabLabel($method)) . '</button>';
             $panels .= '<div class="ep-panel' . $hidden . '" data-method="' . $this->esc($method) . '">'
@@ -203,11 +203,19 @@ class Payment_Adapter_EasyPay implements \FOSSBilling\InjectionAwareInterface
             // Keep a stable transaction id for the whole lifecycle of this record.
             $txnId = (string) ($tx->txn_id ?: $this->generateTxnId($invoice));
 
-            if ($isLeapa || $isAdmin) {
+            // When an admin clicks "Process", FOSSBilling re-runs the *stored* IPN,
+            // which still carries source='ipn' (not 'admin') — so we can't rely on
+            // the source alone. A manual transaction we have already recorded as
+            // pending (it carries one of our EP- ids) that is being processed again
+            // is the administrator's approval to settle.
+            $alreadyRecorded = str_starts_with((string) $tx->txn_id, self::TXN_PREFIX);
+            $adminApproval = $isAdmin || $alreadyRecorded;
+
+            if ($isLeapa || $adminApproval) {
                 return $this->settle($tx, $invoice, $method, $txnId, $data);
             }
 
-            // Manual method, customer side: record it as pending for the admin.
+            // First time we see this manual transaction: record it as pending.
             return $this->recordPending($tx, $invoice, $method, $txnId, $data);
         } catch (Payment_Exception $e) {
             throw $e;
@@ -586,7 +594,7 @@ class Payment_Adapter_EasyPay implements \FOSSBilling\InjectionAwareInterface
     .ep-muted{color:var(--ep-muted);font-size:14px}
     .ep-warn{color:#9a6700;background:#fff8e6;border-radius:8px;padding:9px 12px;font-size:13px;margin:0 0 12px}
     .ep-card-widget{margin:8px 0 4px}
-    .ep-hidden{display:none}
+    .ep-hidden{display:none!important}
     .ep-flash{background:#e7f6ee;color:var(--ep-accent-dark);border-radius:10px;padding:14px;font-size:14px;text-align:center}
     .easypay-error{max-width:520px;margin:0 auto;padding:16px;border-radius:12px;background:#fdecec;color:#b3261e;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif}
     </style>
@@ -632,7 +640,7 @@ class Payment_Adapter_EasyPay implements \FOSSBilling\InjectionAwareInterface
                     if (!root) { return; }
                     var method = tab.getAttribute('data-method');
                     root.querySelectorAll('.ep-tab').forEach(function (t) { t.classList.toggle('is-active', t === tab); });
-                    root.querySelectorAll('.ep-panel').forEach(function (p) { p.hidden = p.getAttribute('data-method') !== method; });
+                    root.querySelectorAll('.ep-panel').forEach(function (p) { p.classList.toggle('ep-hidden', p.getAttribute('data-method') !== method); });
                     return;
                 }
                 var copy = e.target.closest('.ep-copy');
