@@ -41,6 +41,12 @@ class Payment_Adapter_EasyPay implements \FOSSBilling\InjectionAwareInterface
     /** Methods that wait for a human to confirm the money arrived. */
     private const MANUAL_METHODS = ['ecocash', 'lumicash', 'bancobu', 'otherbanks'];
 
+    /** Default display order when the admin has not set one. */
+    private const DEFAULT_ORDER = ['leapa', 'ecocash', 'lumicash', 'bancobu', 'otherbanks'];
+
+    /** Currencies the Leapa card widget can charge (per Leapa's API). */
+    private const LEAPA_CURRENCIES = ['BIF', 'USD'];
+
     public function __construct(private array $config)
     {
     }
@@ -70,10 +76,23 @@ class Payment_Adapter_EasyPay implements \FOSSBilling\InjectionAwareInterface
             'can_load_in_iframe' => false,
             'supports_one_time_payments' => true,
             'supports_subscriptions' => false,
-            'description' => 'Accept Burundian payments by card (Leapa), EcoCash, Lumicash, '
-                . 'Bancobu eNoti or bank transfer. Card payments are confirmed automatically; '
-                . 'mobile money and bank transfers are recorded as pending for an administrator to verify.',
+            'description' => 'Accept payments by card (Leapa), EcoCash, Lumicash, Bancobu eNoti or bank '
+                . 'transfer. Card payments are confirmed automatically; mobile money and bank transfers are '
+                . 'recorded as pending for an administrator to verify. Works with any FOSSBilling currency '
+                . '(Leapa cards support BIF and USD; other currencies use the manual methods).',
             'form' => [
+                // --- Display ------------------------------------------------
+                'method_order' => self::textField(
+                    'Payment method order',
+                    'Optional. Comma-separated list controlling which method shows first → last, '
+                    . 'e.g. "lumicash, ecocash, bancobu, leapa". Keys: leapa, ecocash, lumicash, bancobu, '
+                    . 'otherbanks. Anything left out keeps the default order.'
+                ),
+                'currency' => self::textField(
+                    'Currency code',
+                    'Optional override sent to the checkout, e.g. BIF. Defaults to the invoice currency.'
+                ),
+
                 // --- Leapa (automatic card payments) -------------------------
                 'enable_leapa' => self::toggle('Enable Leapa (VISA / Mastercard)'),
                 'leapa_test_key' => self::textField(
@@ -83,10 +102,6 @@ class Payment_Adapter_EasyPay implements \FOSSBilling\InjectionAwareInterface
                 'leapa_live_key' => self::textField(
                     'Leapa API key — live',
                     'Used while the gateway is in live mode. Leave empty if unused.'
-                ),
-                'currency' => self::textField(
-                    'Currency code',
-                    'Currency sent to Leapa, e.g. BIF. Defaults to the invoice currency.'
                 ),
 
                 // --- EcoCash -------------------------------------------------
@@ -106,10 +121,16 @@ class Payment_Adapter_EasyPay implements \FOSSBilling\InjectionAwareInterface
 
                 // --- Other banks (wire transfer) -----------------------------
                 'enable_otherbanks' => self::toggle('Enable Other Banks (wire transfer)'),
-                'bank_name' => self::textField('Bank name'),
-                'bank_account_holder' => self::textField('Account holder name'),
-                'bank_account_number' => self::textField('Account number (11 digits)'),
-                'bank_swift' => self::textField('SWIFT / BIC code'),
+                'bank_accounts' => self::textareaField(
+                    'Bank accounts (one per line)',
+                    'Add one bank per line as: Bank name | Account holder | Account number | SWIFT/BIC. '
+                    . 'Example: BANCOBU | HOGI SARL | 20012345678 | BCBUBIBI. '
+                    . 'When filled, this replaces the single-bank fields below.'
+                ),
+                'bank_name' => self::textField('Bank name (single bank — optional)'),
+                'bank_account_holder' => self::textField('Account holder name (single bank)'),
+                'bank_account_number' => self::textField('Account number (single bank)'),
+                'bank_swift' => self::textField('SWIFT / BIC code (single bank)'),
             ],
         ];
     }
@@ -147,7 +168,7 @@ class Payment_Adapter_EasyPay implements \FOSSBilling\InjectionAwareInterface
         $tabs = '';
         $panels = '';
         $first = true;
-        foreach ($this->availableMethods() as $method) {
+        foreach ($this->availableMethods($currency) as $method) {
             $active = $first ? ' is-active' : '';
             $hidden = $first ? '' : ' ep-hidden';
             $tabs .= '<button type="button" class="ep-tab' . $active . '" data-method="' . $this->esc($method) . '">'
@@ -488,39 +509,44 @@ class Payment_Adapter_EasyPay implements \FOSSBilling\InjectionAwareInterface
 
     private function renderBankPanel(array $ctx): string
     {
-        $bank = trim((string) ($this->config['bank_name'] ?? ''));
-        $holder = trim((string) ($this->config['bank_account_holder'] ?? ''));
-        $account = trim((string) ($this->config['bank_account_number'] ?? ''));
-        $swift = trim((string) ($this->config['bank_swift'] ?? ''));
-
-        if ($account === '') {
+        $banks = $this->banks();
+        if ($banks === []) {
             return '<p class="ep-muted">Bank transfer is not fully configured yet. '
                 . 'Please choose another method.</p>';
         }
 
-        $accountWarn = $this->isValidBankAccount($account)
-            ? ''
-            : '<p class="ep-warn">Note: the configured account number is not 11 digits — please double-check it.</p>';
+        $isBif = strtoupper((string) $ctx['currency']) === 'BIF';
+        $multiple = count($banks) > 1;
+        $cards = '';
+        foreach ($banks as $bank) {
+            $rows = '';
+            if ($bank['name'] !== '') {
+                $rows .= '<div class="ep-merchant-row"><span>Bank</span><strong>' . $this->esc($bank['name']) . '</strong></div>';
+            }
+            if ($bank['holder'] !== '') {
+                $rows .= '<div class="ep-merchant-row"><span>Account holder</span><strong>' . $this->esc($bank['holder']) . '</strong></div>';
+            }
+            if ($bank['account'] !== '') {
+                $rows .= '<div class="ep-merchant-row"><span>Account number</span>'
+                    . '<strong class="ep-copy" data-copy="' . $this->esc($bank['account']) . '">' . $this->esc($bank['account']) . '</strong></div>';
+            }
+            if ($bank['swift'] !== '') {
+                $rows .= '<div class="ep-merchant-row"><span>SWIFT / BIC</span><strong>' . $this->esc($bank['swift']) . '</strong></div>';
+            }
+            // The 11-digit rule is Burundi-specific; only hint for BIF accounts.
+            if ($isBif && $bank['account'] !== '' && !$this->isValidBankAccount($bank['account'])) {
+                $rows .= '<div class="ep-merchant-row"><span></span><em class="ep-opt">Account number is not 11 digits — please double-check it.</em></div>';
+            }
+            $cards .= '<div class="ep-merchant">' . $rows . '</div>';
+        }
 
-        $rows = '';
-        if ($bank !== '') {
-            $rows .= '<div class="ep-merchant-row"><span>Bank</span><strong>' . $this->esc($bank) . '</strong></div>';
-        }
-        if ($holder !== '') {
-            $rows .= '<div class="ep-merchant-row"><span>Account holder</span><strong>' . $this->esc($holder) . '</strong></div>';
-        }
-        $rows .= '<div class="ep-merchant-row"><span>Account number</span>'
-            . '<strong class="ep-copy" data-copy="' . $this->esc($account) . '">' . $this->esc($account) . '</strong></div>';
-        if ($swift !== '') {
-            $rows .= '<div class="ep-merchant-row"><span>SWIFT / BIC</span><strong>' . $this->esc($swift) . '</strong></div>';
-        }
+        $lead = $multiple
+            ? 'Transfer <strong>' . $this->esc($ctx['amount_display']) . ' ' . $this->esc($ctx['currency'])
+                . '</strong> to <strong>any</strong> of the accounts below, then confirm so we can match your payment.'
+            : 'Transfer <strong>' . $this->esc($ctx['amount_display']) . ' ' . $this->esc($ctx['currency'])
+                . '</strong> to the account below, then confirm so we can match your payment.';
 
-        return ''
-            . '<p class="ep-lead">Transfer <strong>' . $this->esc($ctx['amount_display']) . ' ' . $this->esc($ctx['currency'])
-            . '</strong> to the account below, then confirm so we can match your payment.</p>'
-            . '<div class="ep-merchant">' . $rows . '</div>'
-            . $accountWarn
-            . $this->renderManualForm('otherbanks', $ctx);
+        return '<p class="ep-lead">' . $lead . '</p>' . $cards . $this->renderManualForm('otherbanks', $ctx);
     }
 
     /** The shared phone + reference confirmation form for every manual method. */
@@ -731,27 +757,125 @@ HTML;
     // Configuration helpers
     // -----------------------------------------------------------------------
 
-    /** Methods to show in the checkout, in display order. */
-    private function availableMethods(): array
+    /**
+     * Methods to show in the checkout, in the admin-configured order.
+     *
+     * Leapa is only offered for currencies its API supports (BIF / USD); for
+     * any other currency the card option is hidden so the widget can't crash,
+     * while every manual method still works with any FOSSBilling currency.
+     */
+    private function availableMethods(string $currency): array
     {
-        $methods = [];
-        if ($this->methodEnabled('enable_leapa') && $this->leapaKey() !== '') {
-            $methods[] = self::METHOD_LEAPA;
+        $enabled = [];
+        if ($this->methodEnabled('enable_leapa') && $this->leapaKey() !== '' && $this->leapaSupportsCurrency($currency)) {
+            $enabled[self::METHOD_LEAPA] = true;
         }
         if ($this->methodEnabled('enable_ecocash') && trim((string) ($this->config['ecocash_code'] ?? '')) !== '') {
-            $methods[] = 'ecocash';
+            $enabled['ecocash'] = true;
         }
         if ($this->methodEnabled('enable_lumicash') && trim((string) ($this->config['lumicash_code'] ?? '')) !== '') {
-            $methods[] = 'lumicash';
+            $enabled['lumicash'] = true;
         }
         if ($this->methodEnabled('enable_bancobu') && trim((string) ($this->config['bancobu_code'] ?? '')) !== '') {
-            $methods[] = 'bancobu';
+            $enabled['bancobu'] = true;
         }
-        if ($this->methodEnabled('enable_otherbanks') && trim((string) ($this->config['bank_account_number'] ?? '')) !== '') {
-            $methods[] = 'otherbanks';
+        if ($this->methodEnabled('enable_otherbanks') && $this->banks() !== []) {
+            $enabled['otherbanks'] = true;
         }
 
-        return $methods;
+        // Order: the admin's list first, then any remaining enabled methods in
+        // the default order.
+        $ordered = [];
+        foreach (array_merge($this->configuredOrder(), self::DEFAULT_ORDER) as $method) {
+            if (isset($enabled[$method])) {
+                $ordered[] = $method;
+                unset($enabled[$method]);
+            }
+        }
+
+        return $ordered;
+    }
+
+    /** The admin's preferred method order, normalised to known method keys. */
+    private function configuredOrder(): array
+    {
+        $raw = strtolower(trim((string) ($this->config['method_order'] ?? '')));
+        if ($raw === '') {
+            return [];
+        }
+
+        $aliases = [
+            'card' => self::METHOD_LEAPA, 'visa' => self::METHOD_LEAPA, 'mastercard' => self::METHOD_LEAPA,
+            'leapa' => self::METHOD_LEAPA,
+            'ecocash' => 'ecocash', 'lumicash' => 'lumicash', 'bancobu' => 'bancobu',
+            'enoti' => 'bancobu', 'bank' => 'otherbanks', 'banks' => 'otherbanks',
+            'wire' => 'otherbanks', 'otherbanks' => 'otherbanks', 'transfer' => 'otherbanks',
+        ];
+
+        $order = [];
+        foreach (preg_split('/[\s,;|>]+/', $raw) as $token) {
+            $token = trim($token);
+            if ($token !== '' && isset($aliases[$token]) && !in_array($aliases[$token], $order, true)) {
+                $order[] = $aliases[$token];
+            }
+        }
+
+        return $order;
+    }
+
+    /** Currencies the Leapa card widget can charge (per Leapa's API). */
+    private function leapaSupportsCurrency(string $currency): bool
+    {
+        return in_array(strtoupper($currency), self::LEAPA_CURRENCIES, true);
+    }
+
+    /**
+     * Configured bank accounts for wire transfers.
+     *
+     * Prefers the multi-bank "bank_accounts" textarea (one bank per line, fields
+     * separated by "|": Name | Account holder | Account number | SWIFT), and
+     * falls back to the legacy single-bank fields for existing installs.
+     *
+     * @return array<int, array{name: string, holder: string, account: string, swift: string}>
+     */
+    private function banks(): array
+    {
+        $banks = [];
+
+        $raw = trim((string) ($this->config['bank_accounts'] ?? ''));
+        if ($raw !== '') {
+            foreach (preg_split('/\r\n|\r|\n/', $raw) as $line) {
+                $line = trim((string) $line);
+                if ($line === '') {
+                    continue;
+                }
+                $parts = array_map('trim', explode('|', $line));
+                $bank = [
+                    'name' => $parts[0] ?? '',
+                    'holder' => $parts[1] ?? '',
+                    'account' => $parts[2] ?? '',
+                    'swift' => $parts[3] ?? '',
+                ];
+                if ($bank['name'] !== '' || $bank['account'] !== '') {
+                    $banks[] = $bank;
+                }
+            }
+        }
+
+        if ($banks === []) {
+            $name = trim((string) ($this->config['bank_name'] ?? ''));
+            $account = trim((string) ($this->config['bank_account_number'] ?? ''));
+            if ($name !== '' || $account !== '') {
+                $banks[] = [
+                    'name' => $name,
+                    'holder' => trim((string) ($this->config['bank_account_holder'] ?? '')),
+                    'account' => $account,
+                    'swift' => trim((string) ($this->config['bank_swift'] ?? '')),
+                ];
+            }
+        }
+
+        return $banks;
     }
 
     /** A toggle is on unless the admin explicitly set it to a falsy value. */
@@ -982,6 +1106,16 @@ HTML;
         }
 
         return ['text', $options];
+    }
+
+    private static function textareaField(string $label, string $description = ''): array
+    {
+        $options = ['label' => $label, 'required' => false];
+        if ($description !== '') {
+            $options['description'] = $description;
+        }
+
+        return ['textarea', $options];
     }
 
     private static function toggle(string $label): array
